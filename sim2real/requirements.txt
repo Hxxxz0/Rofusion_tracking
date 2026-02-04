@@ -5,3 +5,4 @@ onnxruntime
 pyyaml
 scipy
 sshkeyboard
+websockets

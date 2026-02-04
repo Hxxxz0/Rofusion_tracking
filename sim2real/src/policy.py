@@ -1,4 +1,5 @@
 import json
+import socket
 import statistics
 import time
 from pathlib import Path
@@ -236,7 +237,13 @@ class TrackingPolicyRaw(Policy):
             if not isinstance(data, np.lib.npyio.NpzFile):
                 raise ValueError(f"[TrackingPolicyRaw] Only .npz is supported: {path}")
 
-            joint_pos = data["dof_pos"][t0:t1].astype(np.float32)
+            # Support both 'dof_pos' (deployed format) and 'joint_pos' (simple format)
+            if "dof_pos" in data:
+                joint_pos = data["dof_pos"][t0:t1].astype(np.float32)
+            elif "joint_pos" in data:
+                joint_pos = data["joint_pos"][t0:t1].astype(np.float32)
+            else:
+                raise KeyError(f"[TrackingPolicyRaw] Motion file must contain either 'dof_pos' or 'joint_pos': {path}")
             root_pos = data["root_pos"][t0:t1].astype(np.float32)
             root_rot_xyzw = data["root_rot"][t0:t1].astype(np.float32)
             root_quat = np.concatenate([root_rot_xyzw[:, 3:4], root_rot_xyzw[:, :3]], axis=-1)
@@ -346,29 +353,128 @@ class TrackingPolicyRaw(Policy):
         ]
         self.num_obs = sum(m.size for m in self.obs_modules)
 
+    def load_motion_from_file(self, name: str, filepath: str) -> bool:
+        """
+        动态加载新的运动文件到 self.motions 字典
+        支持部署格式（dof_pos）和简单格式（joint_pos）
+        """
+        try:
+            # 检查文件是否存在
+            if not Path(filepath).exists():
+                print(f"[TrackingPolicyRaw] 文件不存在: {filepath}")
+                return False
+            
+            # 加载NPZ文件
+            data = np.load(filepath, allow_pickle=True)
+            if not isinstance(data, np.lib.npyio.NpzFile):
+                print(f"[TrackingPolicyRaw] 不是有效的NPZ文件: {filepath}")
+                return False
+            
+            # 支持两种格式
+            if "dof_pos" in data:
+                joint_pos = data["dof_pos"].astype(np.float32)
+            elif "joint_pos" in data:
+                joint_pos = data["joint_pos"].astype(np.float32)
+            else:
+                print(f"[TrackingPolicyRaw] NPZ文件必须包含 'dof_pos' 或 'joint_pos' 字段")
+                return False
+            
+            root_pos = data["root_pos"].astype(np.float32)
+            root_rot_xyzw = data["root_rot"].astype(np.float32)
+            
+            # 转换格式：root_rot xyzw → wxyz
+            root_quat = np.concatenate([root_rot_xyzw[:, 3:4], root_rot_xyzw[:, :3]], axis=-1)
+            
+            # 处理joint_names映射（如果存在）
+            joint_names = data.get("joint_names", None)
+            if joint_names is not None:
+                joint_names = joint_names.tolist()
+                target_names = list(self.config.dataset_joint_names)
+                if joint_names != target_names:
+                    name_to_idx = {n: i for i, n in enumerate(joint_names)}
+                    remap = np.zeros((joint_pos.shape[0], len(target_names)), dtype=np.float32)
+                    for i, n in enumerate(target_names):
+                        j = name_to_idx.get(n, None)
+                        if j is not None:
+                            remap[:, i] = joint_pos[:, j]
+                    joint_pos = remap
+            
+            # 添加到motions字典
+            self.motions[name] = {
+                "joint_pos": joint_pos,   # (T,J)
+                "root_quat": root_quat,   # (T,4) wxyz
+                "root_pos": root_pos,     # (T,3)
+            }
+            
+            print(f"[TrackingPolicyRaw] 成功加载动作 '{name}': {joint_pos.shape[0]} 帧")
+            return True
+            
+        except Exception as e:
+            print(f"[TrackingPolicyRaw] 加载动作失败 '{name}': {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def request_motion(self, name: str) -> bool:
+        """
+        请求切换到新动作（允许中断当前动作）
+        """
         if name not in self.motions:
             print(f"[TrackingPolicyRaw] Unknown motion '{name}'")
             return False
-        if (self.current_name == "default" or name == "default") and self.current_done:
+        
+        # 修改逻辑：允许在任何时候切换到新动作或default
+        if name == "default":
+            # default可以随时切换
+            self._start_motion_from_current(name)
+            return True
+        elif self.current_name == "default" and self.current_done:
+            # 从default开始新动作
             self._start_motion_from_current(name)
             return True
         else:
-            print(f"[TrackingPolicyRaw] Reject '{name}': current='{self.current_name}', done={self.current_done}")
-            return False
+            # 新增：动作执行中也允许切换（中断当前动作）
+            print(f"[TrackingPolicyRaw] Interrupting '{self.current_name}' to start '{name}'")
+            self._start_motion_from_current(name)
+            return True
 
     def update_obs(self):
         if self._udp_server is not None:
             for cmd in self._udp_server.pop_all():
-                if cmd == "default":
+                # 新增：处理 LOAD: 命令
+                if cmd.startswith("LOAD:"):
+                    motion_name = cmd[5:].strip()
+                    filepath = REAL_G1_ROOT / "assets/data/generated" / f"{motion_name}.npz"
+                    if self.load_motion_from_file(motion_name, str(filepath)):
+                        # 新动作到来时，允许中断当前动作
+                        self.request_motion(motion_name)
+                elif cmd == "default":
                     self.request_motion("default")
                 else:
                     self.request_motion(cmd)
+        
+        # 原有逻辑：更新ref_idx
         if self.ref_len > 0 and self.ref_idx < self.ref_len - 1:
             self.ref_idx += 1
             if self.ref_idx == self.ref_len - 1:
                 self.current_done = True
+                # 新增：发送动作完成通知（仅非default动作）
+                if self.current_name != "default":
+                    self._send_motion_complete_notification()
+        
         super().update_obs()
+
+    def _send_motion_complete_notification(self):
+        """
+        通过UDP发送动作完成通知到text_to_motion.py
+        注意：只在非default动作完成时调用，避免无限循环
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(b"MOTION_COMPLETE", ("127.0.0.1", 28563))
+            sock.close()
+        except Exception:
+            pass  # 静默失败，不影响主流程
 
     def _read_current_state(self) -> Dict[str, np.ndarray]:
         q_real = self.controller.qj_real.copy()

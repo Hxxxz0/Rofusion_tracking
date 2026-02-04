@@ -34,11 +34,18 @@ Tested on Ubuntu 22.04 with Python 3.10
 ## Run Sim2Real
 1. Power on G1 and connect to your PC via Ethernet cable.
    - Set your PC's Ethernet interface to a static IP in the `192.168.123.x` subnet.
-2. Launch the controller pointing at the appropriate interface:
+   
+2. **⚠️ IMPORTANT: Enter Debug Mode (Damping Mode)**
+   - G1 defaults to zero-torque mode (**purple light steady**)
+   - **Press `L2 + R2` on the remote controller** to enter debug mode
+   - Light changes to **orange steady** - this is required for low-level control
+   
+3. Launch the controller pointing at the appropriate interface:
    ```bash
    python3 src/deploy.py --net <robot_iface> --real
    ```
-3. The state machine matches Sim2Sim but with `physical remote controller` input
+   
+4. The state machine matches Sim2Sim but with `physical remote controller` input
    - Zero torque
    - (Press `start`) → move to default pose
    - Place robot on the ground
