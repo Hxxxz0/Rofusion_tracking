@@ -75,6 +75,7 @@ BANNER = """\
 
 命令:
   <文本描述>  - 生成新动作
+  up          - 站起并自动恢复（摔倒后使用）
   default     - 手动回到默认姿态
   last        - 重新加载上一个生成的动作
   list        - 显示所有已生成的动作
@@ -87,7 +88,7 @@ BANNER = """\
 
 
 class MotionStatusListener(threading.Thread):
-    """监听来自policy.py的动作完成通知"""
+    """监听来自policy.py的动作完成和站起成功通知"""
     
     def __init__(self, port: int = 28563):
         super().__init__(daemon=True)
@@ -95,10 +96,15 @@ class MotionStatusListener(threading.Thread):
         self._sock = None
         self._running = True
         self._motion_complete_callback = None
+        self._upright_success_callback = None
         
     def set_callback(self, callback):
         """设置动作完成回调函数"""
         self._motion_complete_callback = callback
+    
+    def set_upright_callback(self, callback):
+        """设置站起成功回调函数"""
+        self._upright_success_callback = callback
     
     def run(self):
         """监听线程主循环"""
@@ -117,6 +123,8 @@ class MotionStatusListener(threading.Thread):
                 msg = data.decode("utf-8", errors="ignore").strip()
                 if msg == "MOTION_COMPLETE" and self._motion_complete_callback:
                     self._motion_complete_callback()
+                elif msg == "UPRIGHT_SUCCESS" and self._upright_success_callback:
+                    self._upright_success_callback()
             except socket.timeout:
                 continue
             except Exception as e:
@@ -178,6 +186,7 @@ class TextToMotionClient:
         # 状态
         self.last_generated = None
         self.current_status = "空闲"
+        self._is_up_mode = False  # 是否在站起模式
         
         # 状态监听器
         self.status_listener = MotionStatusListener(self.status_port)
@@ -190,10 +199,25 @@ class TextToMotionClient:
     def _on_motion_complete(self):
         """动作完成回调"""
         print(f"\n[完成] 动作执行完毕")
-        if self.auto_default:
+        
+        # 如果在站起模式但动作完成时仍未站起，显示警告
+        if self._is_up_mode:
+            print("[警告] 站起动作已完成，但机器人仍未检测到直立姿态")
+            print("       请检查机器人状态或手动输入命令")
+            self._is_up_mode = False
+            self.current_status = "空闲"
+        elif self.auto_default:
             print("[自动切换] 发送default命令...")
             self._send_udp_command("default")
             self.current_status = "空闲"
+    
+    def _on_upright_success(self):
+        """站起成功回调"""
+        print(f"\n[成功] 检测到机器人已站起！")
+        print("[自动切换] 发送default命令...")
+        self._send_udp_command("default")
+        self._is_up_mode = False
+        self.current_status = "空闲"
     
     def _send_udp_command(self, command: str) -> bool:
         """发送UDP命令到deploy.py"""
@@ -463,6 +487,19 @@ async def interactive_loop(client: TextToMotionClient):
             elif cmd_lower == 'default':
                 client._send_udp_command('default')
                 client.current_status = "空闲"
+                client._is_up_mode = False
+            
+            elif cmd_lower == 'up':
+                # 站起命令：播放站起动作并自动监测
+                print("[站起] 开始站起流程...")
+                client._is_up_mode = True
+                client.current_status = "站起中"
+                # 设置站起成功回调
+                client.status_listener.set_upright_callback(client._on_upright_success)
+                # 发送加载站起动作命令
+                client._send_udp_command("fallAndGetUp2_subject2")
+                # 发送开始监测命令
+                client._send_udp_command("START_UPRIGHT_MONITORING")
             
             elif cmd_lower == 'last':
                 if client.last_generated:

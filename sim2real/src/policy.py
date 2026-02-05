@@ -64,6 +64,100 @@ class ONNXModule:
         return outputs
 
 # =========================================
+# Upright Detector
+# =========================================
+class UprightDetector:
+    """
+    Monitors robot IMU and joint angles to detect successful standing up.
+    Uses roll/pitch angles AND knee joint angles to determine if robot is truly upright.
+    """
+    def __init__(self, controller, threshold_deg: float = 15.0, knee_threshold_rad: float = 0.3, consecutive_frames: int = 4):
+        """
+        Args:
+            controller: Robot controller with .quat and .qj_isaac attributes
+            threshold_deg: Maximum absolute roll/pitch angle (degrees) to consider upright
+            knee_threshold_rad: Maximum absolute knee angle (radians) to consider legs straight (0.3 rad ≈ 17°)
+            consecutive_frames: Number of consecutive frames that must satisfy condition
+        """
+        self.controller = controller
+        self.threshold_rad = np.deg2rad(threshold_deg)
+        self.knee_threshold_rad = knee_threshold_rad
+        self.consecutive_frames = consecutive_frames
+        self.upright_count = 0
+        self.is_monitoring = False
+        
+        # Isaac joint order indices for knee joints
+        self.left_knee_idx = 9   # "left_knee_joint" in ISAAC_JOINT_ORDER
+        self.right_knee_idx = 10  # "right_knee_joint" in ISAAC_JOINT_ORDER
+    
+    def start_monitoring(self):
+        """Start monitoring for upright condition"""
+        self.is_monitoring = True
+        self.upright_count = 0
+        print(f"[UprightDetector] Started monitoring")
+        print(f"  - IMU姿态: roll/pitch < ±{np.rad2deg(self.threshold_rad):.1f}°")
+        print(f"  - 膝盖角度: < {np.rad2deg(self.knee_threshold_rad):.1f}° (伸直)")
+        print(f"  - 连续帧数: {self.consecutive_frames}")
+    
+    def stop_monitoring(self):
+        """Stop monitoring"""
+        self.is_monitoring = False
+        self.upright_count = 0
+        print(f"[UprightDetector] Stopped monitoring")
+    
+    def check(self) -> bool:
+        """
+        Check if robot is upright based on IMU quaternion AND knee angles.
+        Returns True if upright condition satisfied for consecutive_frames.
+        """
+        if not self.is_monitoring:
+            return False
+        
+        # 1. Check IMU orientation (roll and pitch)
+        quat = self.controller.quat  # [w, x, y, z] - scalar first
+        r = R.from_quat(quat, scalar_first=True)
+        roll, pitch, yaw = r.as_euler('xyz')
+        
+        imu_ok = (abs(roll) < self.threshold_rad) and (abs(pitch) < self.threshold_rad)
+        
+        # 2. Check knee angles (legs should be straight)
+        qj = self.controller.qj_isaac  # Joint positions in Isaac order
+        left_knee = abs(qj[self.left_knee_idx])
+        right_knee = abs(qj[self.right_knee_idx])
+        
+        knees_ok = (left_knee < self.knee_threshold_rad) and (right_knee < self.knee_threshold_rad)
+        
+        # Both conditions must be satisfied
+        is_upright = imu_ok and knees_ok
+        
+        # 调试：每30帧打印一次当前状态
+        if self.upright_count % 30 == 0:
+            print(f"[UprightDetector] 检测中 [{self.upright_count}/{self.consecutive_frames}]:")
+            print(f"  IMU: roll={np.rad2deg(roll):.1f}°, pitch={np.rad2deg(pitch):.1f}° {'✓' if imu_ok else '✗'}")
+            print(f"  膝盖: 左={np.rad2deg(left_knee):.1f}°, 右={np.rad2deg(right_knee):.1f}° {'✓' if knees_ok else '✗'}")
+        
+        if is_upright:
+            self.upright_count += 1
+            if self.upright_count >= self.consecutive_frames:
+                print(f"[UprightDetector] SUCCESS - Robot upright!")
+                print(f"  - IMU: roll={np.rad2deg(roll):.1f}°, pitch={np.rad2deg(pitch):.1f}°")
+                print(f"  - 膝盖: 左={np.rad2deg(left_knee):.1f}°, 右={np.rad2deg(right_knee):.1f}°")
+                return True
+        else:
+            # Reset counter if condition not met
+            if self.upright_count > 0:
+                # Print debug info when losing upright condition
+                reason = []
+                if not imu_ok:
+                    reason.append(f"IMU姿态(roll={np.rad2deg(roll):.1f}°, pitch={np.rad2deg(pitch):.1f}°)")
+                if not knees_ok:
+                    reason.append(f"膝盖弯曲(左={np.rad2deg(left_knee):.1f}°, 右={np.rad2deg(right_knee):.1f}°)")
+                print(f"[UprightDetector] 检测中断: {', '.join(reason)}")
+            self.upright_count = 0
+        
+        return False
+
+# =========================================
 # Policy Base
 # =========================================
 class Policy:
@@ -309,6 +403,14 @@ class TrackingPolicyRaw(Policy):
             except Exception as e:
                 print(f"[TrackingPolicyRaw] Failed to start UDP server: {e}")
 
+        # Upright detector for "up" command (IMU姿态 + 膝盖角度)
+        self._upright_detector = UprightDetector(
+            controller, 
+            threshold_deg=15.0,      # IMU roll/pitch threshold
+            knee_threshold_rad=0.6,  # Knee angle threshold (≈34°) - 站立时膝盖可能稍微弯曲
+            consecutive_frames=4
+        )
+
         super().__init__(name, policy_cfg, controller)
         self.init_count = 0
 
@@ -448,10 +550,20 @@ class TrackingPolicyRaw(Policy):
                     if self.load_motion_from_file(motion_name, str(filepath)):
                         # 新动作到来时，允许中断当前动作
                         self.request_motion(motion_name)
+                elif cmd == "START_UPRIGHT_MONITORING":
+                    # 开始监测站起状态
+                    self._upright_detector.start_monitoring()
                 elif cmd == "default":
                     self.request_motion("default")
                 else:
                     self.request_motion(cmd)
+        
+        # 检查站起状态（如果正在监测）
+        if self._upright_detector.is_monitoring:
+            if self._upright_detector.check():
+                # 站起成功！发送通知并停止监测
+                self._send_upright_success_notification()
+                self._upright_detector.stop_monitoring()
         
         # 原有逻辑：更新ref_idx
         if self.ref_len > 0 and self.ref_idx < self.ref_len - 1:
@@ -461,6 +573,10 @@ class TrackingPolicyRaw(Policy):
                 # 新增：发送动作完成通知（仅非default动作）
                 if self.current_name != "default":
                     self._send_motion_complete_notification()
+                    # 如果在监测站起但动作已完成仍未站起，停止监测
+                    if self._upright_detector.is_monitoring:
+                        print("[UprightDetector] Motion completed but robot not upright - stopping monitoring")
+                        self._upright_detector.stop_monitoring()
         
         super().update_obs()
 
@@ -475,6 +591,18 @@ class TrackingPolicyRaw(Policy):
             sock.close()
         except Exception:
             pass  # 静默失败，不影响主流程
+    
+    def _send_upright_success_notification(self):
+        """
+        通过UDP发送站起成功通知到text_to_motion.py
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(b"UPRIGHT_SUCCESS", ("127.0.0.1", 28563))
+            sock.close()
+            print("[TrackingPolicyRaw] Sent UPRIGHT_SUCCESS notification")
+        except Exception as e:
+            print(f"[TrackingPolicyRaw] Failed to send UPRIGHT_SUCCESS: {e}")
 
     def _read_current_state(self) -> Dict[str, np.ndarray]:
         q_real = self.controller.qj_real.copy()
