@@ -203,3 +203,6 @@ sim2sim/real_g1/plot
 sim2sim/real_g1/*.npy
 motion.npy
 dataset
+
+# Generated motion data
+sim2real/assets/data/generated/
